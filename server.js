@@ -150,7 +150,6 @@ const io = new Server(server, {
   }
 });
 
-// Modified rooms structure to track creator
 const rooms = {}; // { roomName: { password: string, creatorId: string, users: string[] } }
 
 app.use('/songs', express.static(path.join(__dirname, 'songs')));
@@ -158,127 +157,131 @@ app.use('/songs', express.static(path.join(__dirname, 'songs')));
 io.on('connection', (socket) => {
   console.log('✅ User connected:', socket.id);
 
-  // Get user's rooms
+  // Get user's rooms (with callback check)
   socket.on('get_my_rooms', (userId, callback) => {
-    const userRooms = Object.entries(rooms)
-      .filter(([_, roomData]) => roomData.creatorId === userId)
-      .map(([roomName]) => roomName);
-    callback(userRooms);
+    if (typeof callback !== 'function') return; // Safety check
+    
+    try {
+      const userRooms = Object.entries(rooms)
+        .filter(([_, roomData]) => roomData.creatorId === userId)
+        .map(([roomName]) => roomName);
+      callback({ success: true, rooms: userRooms });
+    } catch (err) {
+      console.error('Error in get_my_rooms:', err);
+      callback?.({ success: false, error: 'Server error' });
+    }
   });
 
-  // Create room (now with creator tracking)
+  // Create room (with callback safety)
   socket.on('create_room', ({ room, password, username, creatorId }, callback) => {
-    if (rooms[room]) return callback({ success: false, error: 'Room already exists' });
+    if (typeof callback !== 'function') callback = () => {}; // Default empty function
     
-    rooms[room] = {
-      password,
-      creatorId,
-      users: [username]
-    };
-    
-    socket.join(room);
-    socket.data.room = room;
-    socket.data.username = username;
-    socket.data.userId = creatorId;
-    
-    // Only send back to creator
-    socket.emit('my_rooms', Object.keys(rooms).filter(r => rooms[r].creatorId === creatorId));
-    
-    io.to(room).emit('receive_message', {
-      message: `${username} has joined the chat.`,
-      system: true
-    });
-    
-    callback({ success: true });
-  });
-
-  // Join room (updated for private rooms)
-  socket.on('join_room', ({ room, password, username }, callback) => {
-    if (!rooms[room]) return callback({ success: false, error: 'Room does not exist' });
-    if (rooms[room].password !== password) return callback({ success: false, error: 'Incorrect password' });
-    
-    socket.join(room);
-    socket.data.room = room;
-    socket.data.username = username;
-    rooms[room].users.push(username);
-    
-    io.to(room).emit('receive_message', {
-      message: `${username} has joined the chat.`,
-      system: true
-    });
-    
-    callback({ success: true });
-  });
-
-  // Handle leaving room
-  socket.on('leave_room', ({ room, username }) => {
-    if (room && username) {
+    try {
+      if (rooms[room]) {
+        return callback({ success: false, error: 'Room already exists' });
+      }
+      
+      rooms[room] = { password, creatorId, users: [username] };
+      socket.join(room);
+      socket.data = { room, username, userId: creatorId };
+      
+      // Confirm only to creator
+      callback({ success: true });
+      
+      // Notify room
       io.to(room).emit('receive_message', {
-        message: `${username} has left the chat.`,
+        message: `${username} has joined the chat.`,
         system: true
       });
-      
-      if (rooms[room] && rooms[room].users) {
-        rooms[room].users = rooms[room].users.filter(u => u !== username);
-      }
+    } catch (err) {
+      console.error('Error in create_room:', err);
+      callback({ success: false, error: 'Server error' });
     }
-    socket.leave(room);
-    socket.data.room = null;
-    socket.data.username = null;
   });
 
-  // Delete room (now creator-only)
+  // Join room (with error handling)
+  socket.on('join_room', ({ room, password, username }, callback) => {
+    if (typeof callback !== 'function') callback = () => {};
+    
+    try {
+      const roomData = rooms[room];
+      if (!roomData) {
+        return callback({ success: false, error: 'Room does not exist' });
+      }
+      if (roomData.password !== password) {
+        return callback({ success: false, error: 'Incorrect password' });
+      }
+      
+      socket.join(room);
+      socket.data = { room, username };
+      roomData.users.push(username);
+      
+      callback({ success: true });
+      io.to(room).emit('receive_message', {
+        message: `${username} has joined the chat.`,
+        system: true
+      });
+    } catch (err) {
+      console.error('Error in join_room:', err);
+      callback({ success: false, error: 'Server error' });
+    }
+  });
+
+  // Delete room (with validation)
   socket.on('delete_room', ({ room, password, creatorId }, callback) => {
-    if (!rooms[room]) return callback({ success: false, error: 'Room does not exist' });
-    if (rooms[room].creatorId !== creatorId) return callback({ success: false, error: 'Not authorized' });
-    if (rooms[room].password !== password) return callback({ success: false, error: 'Incorrect password' });
+    if (typeof callback !== 'function') callback = () => {};
     
-    // Notify all users in room
-    io.to(room).emit('room_deleted', { room });
-    
-    // Remove room
-    delete rooms[room];
-    
-    // Update creator's room list
-    socket.emit('my_rooms', Object.keys(rooms).filter(r => rooms[r].creatorId === creatorId));
-    
-    callback({ success: true });
+    try {
+      const roomData = rooms[room];
+      if (!roomData) {
+        return callback({ success: false, error: 'Room does not exist' });
+      }
+      if (roomData.creatorId !== creatorId) {
+        return callback({ success: false, error: 'Not authorized' });
+      }
+      if (roomData.password !== password) {
+        return callback({ success: false, error: 'Incorrect password' });
+      }
+      
+      // Notify users before deletion
+      io.to(room).emit('room_deleted', { room });
+      delete rooms[room];
+      
+      callback({ success: true });
+    } catch (err) {
+      console.error('Error in delete_room:', err);
+      callback({ success: false, error: 'Server error' });
+    }
   });
 
-  // Messaging remains the same
+  // Other events (no callback needed)
   socket.on('send_message', ({ room, message, username }) => {
-    const senderUsername = username || socket.data.username || 'Unknown';
-    io.to(room).emit('receive_message', { 
-      message,
-      senderId: socket.id, 
-      username: senderUsername 
-    });
+    const sender = username || socket.data.username || 'Unknown';
+    io.to(room).emit('receive_message', { message, username: sender });
   });
 
-  // File handling remains the same
   socket.on('get_songs', (callback) => {
-    const songsDir = path.join(__dirname, 'songs');
-    fs.readdir(songsDir, (err, files) => {
+    if (typeof callback !== 'function') return;
+    
+    fs.readdir(path.join(__dirname, 'songs'), (err, files) => {
       if (err) {
-        console.error('Error reading songs folder:', err);
+        console.error('Error reading songs:', err);
         return callback([]);
       }
-      const mp3s = files.filter(file => file.endsWith('.mp3'));
-      callback(mp3s);
+      callback(files.filter(file => file.endsWith('.mp3')));
     });
   });
 
-  // Handle disconnect
   socket.on('disconnect', () => {
-    const room = socket.data.room;
-    const username = socket.data.username;
+    const { room, username } = socket.data || {};
     if (room && username) {
       io.to(room).emit('receive_message', {
-        message: `${username} has left the chat.`,
+        message: `${username} has left.`,
         system: true
       });
       
-      if (rooms[room] && rooms[room].users) {
+      // Cleanup user from room
+      if (rooms[room]?.users) {
         rooms[room].users = rooms[room].users.filter(u => u !== username);
       }
     }
@@ -288,5 +291,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 Server listening on http://localhost:${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
